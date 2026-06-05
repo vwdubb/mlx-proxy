@@ -2,7 +2,6 @@ import { createServer, request } from "http";
 const {
   MLX_HOST = "host.docker.internal", MLX_PORT = 8080, MLX_PROXY_PORT = 8081, TZ = "UTC",
   OMLX_API_KEY = "", OMLX_HEADROOM_MB = "1024", OMLX_API_TIMEOUT_MS = "5000",
-  OMLX_UNLOAD_IDLE_TIMEOUT_MS = "30000", OMLX_IDLE_POLL_MS = "250",
 } = process.env;
 
 const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -22,7 +21,7 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 //                                  whole-server final_ceiling + current_model_memory
 //                                  (one snapshot => consistent memory accounting)
 //   GET  /api/status             - server-wide active/waiting request counts (idle gate)
-//   POST /v1/models/{id}/unload  - unload a model (immediate abort, hence idle-wait)
+//   POST /v1/models/{id}/unload  - unload a model (immediate abort of its requests)
 //
 // Policy (per project requirements):
 //   - Unload the least-recently-used *non-pinned* models, one at a time, only
@@ -33,23 +32,20 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 //     each see free RAM and both be waved through, overcommitting the ceiling. We
 //     serialize admission and, once a model is admitted, count its size against
 //     free RAM until oMLX reports it loaded — so the next admission sees the
-//     pending load and unloads (or fails closed) accordingly.
-//   - NEVER abort an in-flight request. oMLX's unload is an *immediate abort*:
-//     it kills whatever that model is generating. oMLX only reports request
-//     counts SERVER-WIDE (active_requests + waiting_requests in /api/status) —
-//     there is no per-model busy flag — so the only signal that guarantees a
-//     given model is idle is the whole server being idle. We therefore wait for
-//     oMLX to report zero active AND zero waiting requests before unloading
-//     anything, polling up to OMLX_UNLOAD_IDLE_TIMEOUT_MS. (Relying on the
-//     proxy's own per-model in-flight count is unsound: it misses requests that
-//     bypass the proxy, that oMLX has queued, or whose model name didn't match
-//     the key we tracked — any of which an immediate-abort unload would kill.)
-//   - Fail closed: return 503 rather than risk an OOM on the oMLX host when
+//     pending load and unloads (or rejects) accordingly.
+//   - NEVER abort an in-flight request, and NEVER wait. oMLX's unload is an
+//     *immediate abort* of that model's requests, and oMLX reports work only
+//     SERVER-WIDE (active_requests + waiting_requests in /api/status; no per-model
+//     busy flag) — so the only safe time to unload is when the whole server is
+//     idle. If a request needs memory freed and oMLX is doing ANY work, we reject
+//     it (503) immediately rather than wait for a lull or interrupt the work; the
+//     idle state is re-checked right before each unload to keep the window tiny.
+//   - Fail closed: return 503 rather than risk an OOM or an aborted request when
 //     either (a) the memory check itself can't be completed (oMLX unreachable,
-//     bad/missing key, unexpected response, unknown model), or (b) room *could*
-//     have been made by unloading non-pinned models but the server wouldn't go
-//     idle in time. When the fit is impossible anyway (only pinned models block
-//     it, or the model exceeds the ceiling), we proxy as-is and let oMLX cope.
+//     bad/missing key, unexpected response, unknown model), or (b) room must be
+//     freed but oMLX is busy. When the fit is impossible anyway (only pinned models
+//     block it, or the model exceeds the ceiling) and the server is idle, we proxy
+//     as-is and let oMLX render its verdict.
 //
 // Enabled only when OMLX_API_KEY is set. It also auto-detects oMLX: if the
 // upstream doesn't expose the oMLX management API (the endpoints 404 — e.g. a
@@ -60,10 +56,6 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 const MEMORY_MGMT = OMLX_API_KEY.length > 0;
 const HEADROOM = Number(OMLX_HEADROOM_MB) * 1024 * 1024;
 const REQ_TIMEOUT = Number(OMLX_API_TIMEOUT_MS);
-const IDLE_TIMEOUT = Number(OMLX_UNLOAD_IDLE_TIMEOUT_MS);
-const IDLE_POLL = Number(OMLX_IDLE_POLL_MS);
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Serialize load-admission. Two requests arriving close together would otherwise
 // each read oMLX's current memory, each see the model fits, and both get waved
@@ -160,16 +152,9 @@ const serverStatus = async () => {
 // unload (fail safe — we never risk aborting an in-flight request we can't see).
 const serverIdle = s => Number(s.active_requests) === 0 && Number(s.waiting_requests) === 0;
 
-// Wait until oMLX reports a fully idle server (so an immediate-abort unload can't
-// kill anything), re-polling /api/status up to OMLX_UNLOAD_IDLE_TIMEOUT_MS.
-const waitForServerIdle = async () => {
-  const deadline = Date.now() + IDLE_TIMEOUT;
-  while (!serverIdle(await serverStatus())) {
-    if (Date.now() >= deadline) return false;
-    await sleep(IDLE_POLL);
-  }
-  return true;
-};
+// True iff oMLX reports a fully idle server right now (single check — we never
+// wait/poll, so an unload can't catch a generation that starts while we wait).
+const isServerIdle = async () => serverIdle(await serverStatus());
 
 const unload = async id => {
   const res = await omlxRequest("POST", `/v1/models/${encodeURIComponent(id)}/unload`);
@@ -215,40 +200,34 @@ const ensureFits = async requested => {
     const need = (w.estimated_size || 0) + HEADROOM;
     if (free >= need) { reserve(w.id, w.estimated_size || 0); return w.id; }
 
-    const victims = st.models
-      .filter(m => m.loaded && !m.pinned && m.id !== w.id)
-      .sort((a, b) => lastAccess(a) - lastAccess(b)); // oldest first
-    const reclaimable = victims.reduce((sum, v) => sum + sizeOf(v), 0);
+    // Reaching here means the request needs room freed. oMLX's unload is an
+    // immediate abort, and forwarding a load into a busy oMLX lets oMLX itself
+    // evict-and-abort — so if oMLX is doing ANY work, reject now. We never wait:
+    // the client retries when the server is idle.
+    if (!(await isServerIdle()))
+      throw new OmlxError(`"${requested}" needs memory freed but oMLX is busy; rejecting rather than abort an in-flight request — retry when idle`);
 
-    if (free + reclaimable < need) {
-      // Can't fit even after unloading every non-pinned victim. If it WOULD fit
-      // were it not for memory promised to other in-flight loads, the conflict is
-      // transient — fail closed so the client retries once those loads settle.
-      if (freeNoResv + reclaimable >= need)
-        throw new OmlxError(`"${requested}" can't fit yet: ${reserved} bytes are reserved for other in-flight model loads; retry shortly`);
-      // Genuinely blocked — by pinned models, or the model is too big for the
-      // ceiling. Unloading can't help, so proxy as-is (unreserved) and let oMLX cope.
+    // oMLX is idle. Candidates: loaded, non-pinned, not the target, and not held by
+    // another in-flight request (reserved). Oldest first.
+    const victims = st.models
+      .filter(m => m.loaded && !m.pinned && m.id !== w.id && !reservations.has(m.id))
+      .sort((a, b) => lastAccess(a) - lastAccess(b));
+
+    if (free + victims.reduce((sum, v) => sum + sizeOf(v), 0) < need) {
+      // Can't fit even after unloading every eligible model — blocked by pinned
+      // models or simply too big for the ceiling. Unloading can't help; the server
+      // is idle, so proxy as-is (unreserved) and let oMLX render its verdict.
       console.warn(`oMLX: "${requested}" cannot fit even after unloading all non-pinned models (need ${need}, free ${free}); proxying anyway`);
       return null;
     }
 
-    // The fit IS achievable by unloading non-pinned models — but oMLX's unload is an
-    // immediate abort, so we must not unload while anything is generating. Wait for
-    // the whole server to go idle (no per-model busy flag exists). If it won't go
-    // idle in time, fail closed rather than abort an in-flight request or OOM.
-    if (!(await waitForServerIdle())) {
-      console.warn(`oMLX: server still busy after ${IDLE_TIMEOUT}ms; not unloading for "${requested}"`);
-      throw new OmlxError(`could not free enough for "${requested}" in time (need ${need}); oMLX did not go idle within ${IDLE_TIMEOUT}ms, and unloading now would abort an in-flight request`);
-    }
-
-    // Server is idle: every loaded model is quiescent, so unloading the LRU victims
-    // can't interrupt anyone. Recompute free from a fresh snapshot (usage may have
-    // changed while we waited), then unload oldest-first until the request fits.
-    const after = await fetchState();
-    const afterLoaded = new Set(after.models.filter(m => m.loaded).map(m => m.id));
-    free = after.ceiling - after.used - reservedBytes(w.id, afterLoaded);
+    // Unload oldest-first until it fits. Re-check idle immediately before each
+    // abrupt unload (a generation may have just started) and bail out if so — we
+    // would rather reject than abort.
     for (const v of victims) {
       if (free >= need) break;
+      if (!(await isServerIdle()))
+        throw new OmlxError(`"${requested}" needs memory freed but oMLX became busy; rejecting rather than abort an in-flight request — retry when idle`);
       await unload(v.id);
       free += sizeOf(v);
     }

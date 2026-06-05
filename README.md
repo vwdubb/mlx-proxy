@@ -43,9 +43,10 @@ first. All oMLX calls are bearer-authed, so the key is simply sent as
    separately only for the server-wide `active_requests`/`waiting_requests` counts.
 2. **Decide & unload** — if the requested model's estimated size plus a headroom
    margin won't fit in free RAM, unload the **least-recently-used non-pinned**
-   models one at a time, only until it fits. But first **wait for the server to go
-   idle** (see below): oMLX's unload is an *immediate abort* that cancels whatever
-   the model is generating, so the proxy never unloads while anything is in flight.
+   models one at a time, only until it fits — but **only while oMLX is idle**. If
+   oMLX is doing any work, the request is rejected with `503` instead (see below):
+   oMLX's unload is an *immediate abort*, so the proxy never unloads, nor waits,
+   while anything is in flight.
 3. **Proxy** — forward the request as normal.
 
 ### Concurrent loads
@@ -62,42 +63,42 @@ concurrent admission therefore sees the pending load and unloads for it — or, 
 nothing can be freed because the blocker is itself an in-flight load, **fails
 closed with `503` ("retry shortly")** so the client retries once it settles.
 
-### Waiting for idle
+### Never abort, never wait
 
-Unloading a model that's mid-generation would interrupt whoever is using it, and
-oMLX's unload is an **immediate abort** — it kills that model's active requests.
-oMLX only reports request counts **server-wide** (`active_requests` +
-`waiting_requests` in `/api/status`); there is no per-model busy flag. So the only
-signal that *guarantees* a given model is idle is the whole server being idle.
-Before unloading anything, the proxy therefore waits until oMLX reports **zero
-active and zero waiting requests**, re-polling every `OMLX_IDLE_POLL_MS`. Once the
-server is idle, every loaded model is quiescent, so the LRU victims can be unloaded
-without interrupting anyone. If the server won't go idle within
-`OMLX_UNLOAD_IDLE_TIMEOUT_MS`, the proxy **fails closed with `503`** rather than
-abort an in-flight request or forward into a likely out-of-memory.
+Unloading a model that's mid-generation would interrupt whoever is using it:
+oMLX's unload is an **immediate abort** that kills that model's requests, and
+forwarding a fresh load into a busy oMLX lets oMLX itself evict-and-abort to make
+room. oMLX reports work only **server-wide** (`active_requests` +
+`waiting_requests` in `/api/status`); there is no per-model busy flag, so the only
+safe moment to free memory is when the whole server is idle.
 
-> **Why server-wide, not per-model?** An earlier version tracked only the requests
-> flowing **through the proxy**, per model. That missed work oMLX knew about but
-> the proxy didn't — requests that bypassed the proxy, ones oMLX had queued, or a
-> request whose model name didn't match the proxy's bookkeeping key — and an
-> immediate-abort unload would kill them. Gating on oMLX's own idle state closes
-> that gap. The trade-off is that the proxy won't unload while oMLX is serving
-> *any* model (it fails closed with `503` instead); model switches at idle — the
-> common case — are unaffected.
+So when a request needs memory freed and oMLX is doing **any** work, the proxy
+**rejects it immediately with `503`** — it does *not* wait for a lull, and it does
+*not* interrupt the work. The client should retry; once the server is idle the
+retry unloads the LRU victims and proceeds. The idle state is re-checked right
+before each unload, so a generation that starts in the gap still can't be aborted
+(the proxy bails to `503` instead). There is no timeout to tune — a busy server
+means a prompt `503`, every time.
+
+> **Why reject instead of wait?** Waiting was the bug: the proxy would watch for a
+> momentary lull and then unload a few calls later, by which point a new generation
+> had started — and get aborted. Rejecting when busy is both safe and immediate.
+> The trade-off is that under continuous load, model switches that need eviction
+> return `503` until the server quiesces; switches at idle — the common case — are
+> unaffected.
 
 ### Policy
 
-- **Pinned models are never unloaded.** If unloading every non-pinned model
-  still wouldn't make the request fit — because pinned models hold the RAM, or
-  the model is simply too large for the ceiling — unloading can't help, so the
-  proxy forwards the request as-is and lets oMLX handle it.
+- **Pinned models are never unloaded.** If unloading every eligible (loaded,
+  non-pinned, not-reserved) model still wouldn't make the request fit — because
+  pinned models hold the RAM, or the model is too large for the ceiling — unloading
+  can't help; with the server idle the proxy forwards as-is and lets oMLX decide.
 - **Fails closed (when oMLX *is* the backend).** The proxy returns `503` rather
-  than risk an out-of-memory on the oMLX host when **either**: (a) the memory
+  than risk an out-of-memory or an aborted request when **either**: (a) the memory
   check can't be completed — oMLX unreachable, missing/invalid key, unexpected
-  response, or an unknown model; **or** (b) room *could* have been freed by
-  unloading non-pinned models, but the server wouldn't go idle within
-  `OMLX_UNLOAD_IDLE_TIMEOUT_MS`, so the proxy declines to unload (which would
-  abort an in-flight request) or to forward into a likely OOM. (Both are distinct
+  response, or an unknown model; **or** (b) the request needs memory freed but oMLX
+  is busy (any active or waiting request), so unloading would abort an in-flight
+  request and forwarding would invite an oMLX-side eviction. (Both are distinct
   from the *not-oMLX* case above, where the endpoints `404`, which disables the
   feature and proxies normally.)
 - **RAM is read from oMLX itself,** not the proxy's host. The proxy typically
@@ -124,8 +125,6 @@ All configuration is via environment variables.
 | `OMLX_API_KEY` | *(empty)* | oMLX API key (`omlx serve --api-key …`). **Set this to enable memory management;** leave empty for plain pass-through. Auto-disables if the upstream isn't oMLX. |
 | `OMLX_HEADROOM_MB` | `1024` | Free-RAM safety margin (MB) required on top of the model's estimated size. |
 | `OMLX_API_TIMEOUT_MS` | `5000` | Timeout for each oMLX API call (model list, status, unload). |
-| `OMLX_UNLOAD_IDLE_TIMEOUT_MS` | `30000` | Max time to wait for the oMLX server to go idle (zero active/waiting requests) before giving up on unloading and failing closed. |
-| `OMLX_IDLE_POLL_MS` | `250` | How often to re-poll `/api/status` for the server's active/waiting request counts while waiting for idle. |
 
 ## Running
 
