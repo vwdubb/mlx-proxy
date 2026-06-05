@@ -18,7 +18,10 @@ client ──▶ mlx-proxy ──▶ oMLX (/v1/* inference + management)
 ```
 
 For every request the proxy injects the date/time into the last user message and
-forwards it upstream unchanged.
+forwards it upstream unchanged. If `OMLX_API_KEY` is set and the client didn't
+send its own credentials, the proxy adds `Authorization: Bearer <key>` to the
+forwarded request — so callers can point at the proxy without needing the key
+(a client that sends its own `Authorization`/`x-api-key` is left untouched).
 
 Memory management is **entirely optional**. It only runs when `OMLX_API_KEY` is
 set, *and* only if the upstream is actually oMLX: on the first model request the

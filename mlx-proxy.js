@@ -197,6 +197,11 @@ createServer((req, res) => {
     const headers = { ...req.headers, host: `${MLX_HOST}:${MLX_PORT}`, "content-length": body.length };
     delete headers["transfer-encoding"];
 
+    // Authenticate upstream with the configured key when the client didn't send
+    // its own credentials, so callers can point at the proxy without a key.
+    if (OMLX_API_KEY && !headers.authorization && !headers["x-api-key"])
+      headers.authorization = `Bearer ${OMLX_API_KEY}`;
+
     // Count this request against its model (lower-cased, as sent) while it's in
     // flight, so the memory logic can wait for a model to go idle before
     // unloading it. namesOf() checks both a model's id and alias against this.
