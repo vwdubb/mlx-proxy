@@ -11,6 +11,11 @@ services:
       MLX_PORT: 28080
       MLX_PROXY_PORT: 28081
       TZ: America/Toronto
+      # oMLX memory management: set the oMLX API key to enable proactive
+      # unloading of other models so the requested one fits. Leave empty to
+      # disable (plain pass-through). Optionally tune the free-RAM headroom.
+      OMLX_API_KEY: ${OMLX_API_KEY:-}
+      OMLX_HEADROOM_MB: 1024
     extra_hosts:
       - "host.docker.internal:host-gateway"
     mem_limit: 4g
