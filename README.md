@@ -20,8 +20,15 @@ client ──▶ mlx-proxy ──▶ oMLX (/v1/* inference + management)
 For every request the proxy injects the date/time into the last user message and
 forwards it upstream unchanged.
 
-When `OMLX_API_KEY` is set, any `POST` whose JSON body names a `model` also runs a
-memory check first. All oMLX calls are bearer-authed, so the key is simply sent as
+Memory management is **entirely optional**. It only runs when `OMLX_API_KEY` is
+set, *and* only if the upstream is actually oMLX: on the first model request the
+proxy probes the oMLX management API, and if those endpoints aren't there (they
+`404` — e.g. a plain `mlx_lm.server`), it disables itself for the rest of the run
+and proxies normally (date/time injection still applies). So pointing this at a
+non-oMLX backend, or leaving the key unset, behaves exactly like the plain proxy.
+
+When it is active, any `POST` whose JSON body names a `model` runs a memory check
+first. All oMLX calls are bearer-authed, so the key is simply sent as
 `Authorization: Bearer …` — no admin session/cookie needed.
 
 1. **Inspect** — `GET /v1/models/status` for each model's loaded/pinned state,
@@ -53,9 +60,11 @@ proxies as-is if nothing could be freed).
 
 - **Pinned models are never unloaded.** If only pinned models are blocking the
   fit, the proxy forwards the request as-is and lets oMLX handle it.
-- **Fails closed.** If the memory check can't be completed — oMLX unreachable,
-  missing/invalid key, unexpected response, or an unknown model — the proxy
-  returns `503` rather than risk an out-of-memory on the oMLX host.
+- **Fails closed (when oMLX *is* the backend).** If the memory check can't be
+  completed — oMLX unreachable, missing/invalid key, unexpected response, or an
+  unknown model — the proxy returns `503` rather than risk an out-of-memory on
+  the oMLX host. This is distinct from the *not-oMLX* case above (endpoints
+  `404`), which disables the feature and proxies normally.
 - **RAM is read from oMLX itself,** not the proxy's host. The proxy typically
   runs in a container on a different machine than oMLX, so it relies on oMLX's
   enforced memory ceiling from `/api/status` (which already reserves headroom to
@@ -76,7 +85,7 @@ All configuration is via environment variables.
 | `MLX_PORT` | `8080` | Upstream oMLX port. |
 | `MLX_PROXY_PORT` | `8081` | Port the proxy listens on. |
 | `TZ` | `UTC` | Timezone used for the injected date/time. |
-| `OMLX_API_KEY` | *(empty)* | oMLX API key (`omlx serve --api-key …`). **Set this to enable memory management;** leave empty for plain pass-through. |
+| `OMLX_API_KEY` | *(empty)* | oMLX API key (`omlx serve --api-key …`). **Set this to enable memory management;** leave empty for plain pass-through. Auto-disables if the upstream isn't oMLX. |
 | `OMLX_HEADROOM_MB` | `1024` | Free-RAM safety margin (MB) required on top of the model's estimated size. |
 | `OMLX_API_TIMEOUT_MS` | `5000` | Timeout for each oMLX API call (model list, status, unload). |
 | `OMLX_UNLOAD_IDLE_TIMEOUT_MS` | `30000` | Max time to wait for a model to go idle before giving up on unloading it. |

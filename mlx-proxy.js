@@ -35,8 +35,11 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 //     unreachable, bad/missing key, unexpected response, unknown model),
 //     return 503 rather than risk an OOM on the oMLX host.
 //
-// Enabled only when OMLX_API_KEY is set; otherwise the proxy behaves as a
-// plain pass-through.
+// Enabled only when OMLX_API_KEY is set. It also auto-detects oMLX: if the
+// upstream doesn't expose the oMLX management API (the endpoints 404 — e.g. a
+// plain mlx_lm.server), memory management disables itself and the proxy falls
+// back to a plain pass-through (date/time injection only). Either way, a
+// non-oMLX or unconfigured backend still works unchanged.
 // ---------------------------------------------------------------------------
 const MEMORY_MGMT = OMLX_API_KEY.length > 0;
 const HEADROOM = Number(OMLX_HEADROOM_MB) * 1024 * 1024;
@@ -61,6 +64,12 @@ const waitForIdle = async names => {
 };
 
 class OmlxError extends Error {}
+// Thrown when a management endpoint 404s — i.e. the upstream isn't oMLX. Unlike
+// OmlxError (which fails closed), this disables memory management and proxies.
+class NotOmlx extends Error {}
+
+// null = not yet probed, true = oMLX, false = not oMLX (skip memory mgmt).
+let omlxDetected = null;
 
 // Every oMLX call we make is bearer-authed (verify_api_key), so we just send
 // OMLX_API_KEY — no admin session/login/cookie needed.
@@ -87,6 +96,7 @@ const omlxRequest = (method, path, json) => new Promise((resolve, reject) => {
 // state, size, last_access, and alias (model_alias, present when configured).
 const listModels = async () => {
   const res = await omlxRequest("GET", "/v1/models/status");
+  if (res.status === 404) throw new NotOmlx();
   const models = res.data?.models;
   if (res.status !== 200 || !Array.isArray(models)) throw new OmlxError(`oMLX GET /v1/models/status failed (HTTP ${res.status})`);
   return models;
@@ -96,6 +106,7 @@ const listModels = async () => {
 // and current usage (model_memory_used), in bytes. max is null == no limit.
 const serverStatus = async () => {
   const res = await omlxRequest("GET", "/api/status");
+  if (res.status === 404) throw new NotOmlx();
   if (res.status !== 200 || !res.data) throw new OmlxError(`oMLX GET /api/status failed (HTTP ${res.status})`);
   return res.data;
 };
@@ -162,17 +173,24 @@ createServer((req, res) => {
       }
     } catch {}
 
-    if (MEMORY_MGMT && req.method === "POST" && typeof payload?.model === "string") {
+    if (MEMORY_MGMT && omlxDetected !== false && req.method === "POST" && typeof payload?.model === "string") {
       try {
         await ensureFits(payload.model);
+        omlxDetected = true;
       } catch (e) {
-        const detail = e instanceof OmlxError ? e.message : `oMLX memory check error: ${e.message}`;
-        console.error(detail);
-        if (!res.headersSent) {
-          res.writeHead(503, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: { message: detail, type: "omlx_memory_management" } }));
+        if (e instanceof NotOmlx) {
+          // Upstream isn't oMLX (endpoints 404). Disable for this run, proxy on.
+          if (omlxDetected !== false) console.warn(`oMLX management API not found at ${MLX_HOST}:${MLX_PORT}; disabling memory management, proxying normally`);
+          omlxDetected = false;
+        } else {
+          const detail = e instanceof OmlxError ? e.message : `oMLX memory check error: ${e.message}`;
+          console.error(detail);
+          if (!res.headersSent) {
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: detail, type: "omlx_memory_management" } }));
+          }
+          return;
         }
-        return;
       }
     }
 
