@@ -52,8 +52,10 @@ only exposes an *aggregate* active-request count (no per-model busy flag), so th
 proxy instead tracks the requests **it** has in flight per model. Before unloading
 a model it waits until that model's in-flight count drops to zero, polling every
 `OMLX_IDLE_POLL_MS`. If the model is still busy after `OMLX_UNLOAD_IDLE_TIMEOUT_MS`,
-the proxy leaves it loaded and moves on to the next candidate (and ultimately
-proxies as-is if nothing could be freed).
+the proxy leaves it loaded and moves on to the next candidate. If, after trying
+every candidate, room *could* have been made by unloading non-pinned models but
+one wouldn't go idle in time, the proxy **fails closed with `503`** rather than
+forward into a likely out-of-memory (see Policy below).
 
 > This covers traffic flowing **through the proxy** — which is the intended
 > deployment (clients point at the proxy). Requests sent to oMLX directly,
@@ -61,13 +63,18 @@ proxies as-is if nothing could be freed).
 
 ### Policy
 
-- **Pinned models are never unloaded.** If only pinned models are blocking the
-  fit, the proxy forwards the request as-is and lets oMLX handle it.
-- **Fails closed (when oMLX *is* the backend).** If the memory check can't be
-  completed — oMLX unreachable, missing/invalid key, unexpected response, or an
-  unknown model — the proxy returns `503` rather than risk an out-of-memory on
-  the oMLX host. This is distinct from the *not-oMLX* case above (endpoints
-  `404`), which disables the feature and proxies normally.
+- **Pinned models are never unloaded.** If unloading every non-pinned model
+  still wouldn't make the request fit — because pinned models hold the RAM, or
+  the model is simply too large for the ceiling — unloading can't help, so the
+  proxy forwards the request as-is and lets oMLX handle it.
+- **Fails closed (when oMLX *is* the backend).** The proxy returns `503` rather
+  than risk an out-of-memory on the oMLX host when **either**: (a) the memory
+  check can't be completed — oMLX unreachable, missing/invalid key, unexpected
+  response, or an unknown model; **or** (b) room *could* have been freed by
+  unloading non-pinned models, but one wouldn't go idle within
+  `OMLX_UNLOAD_IDLE_TIMEOUT_MS`, so the proxy declines to forward into a likely
+  OOM. (Both are distinct from the *not-oMLX* case above, where the endpoints
+  `404`, which disables the feature and proxies normally.)
 - **RAM is read from oMLX itself,** not the proxy's host. The proxy typically
   runs in a container on a different machine than oMLX, so it relies on oMLX's
   enforced memory ceiling from `/api/status` (which already reserves headroom to

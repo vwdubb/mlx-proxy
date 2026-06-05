@@ -31,9 +31,12 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 //     requests THIS proxy has in flight per model and don't unload a model
 //     until its in-flight count drops to zero. If it stays busy past
 //     OMLX_UNLOAD_IDLE_TIMEOUT_MS, we leave it loaded and move on.
-//   - Fail closed: if the memory check itself can't be completed (oMLX
-//     unreachable, bad/missing key, unexpected response, unknown model),
-//     return 503 rather than risk an OOM on the oMLX host.
+//   - Fail closed: return 503 rather than risk an OOM on the oMLX host when
+//     either (a) the memory check itself can't be completed (oMLX unreachable,
+//     bad/missing key, unexpected response, unknown model), or (b) room *could*
+//     have been made by unloading non-pinned models but one wouldn't go idle in
+//     time. When the fit is impossible anyway (only pinned models block it, or
+//     the model exceeds the ceiling), we proxy as-is and let oMLX cope.
 //
 // Enabled only when OMLX_API_KEY is set. It also auto-detects oMLX: if the
 // upstream doesn't expose the oMLX management API (the endpoints 404 — e.g. a
@@ -144,6 +147,14 @@ const ensureFits = async requested => {
   const victims = models
     .filter(m => m.loaded && !m.pinned && m.id !== want.id)
     .sort((a, b) => lastAccess(a) - lastAccess(b)); // oldest first
+
+  // The most we could reclaim by unloading every non-pinned victim. If even that
+  // wouldn't fit, the request is blocked by pinned models (or is simply too big
+  // for the ceiling): unloading can't help, so per policy we proxy as-is and let
+  // oMLX cope. If it WOULD fit, the fit is achievable and any shortfall below is
+  // only because a victim wouldn't go idle in time.
+  const fitAchievable = free + victims.reduce((sum, v) => sum + sizeOf(v), 0) >= need;
+
   for (const v of victims) {
     if (free >= need) break;
     if (!(await waitForIdle(namesOf(v)))) {
@@ -153,7 +164,16 @@ const ensureFits = async requested => {
     await unload(v.id);
     free += sizeOf(v);
   }
-  if (free < need) console.warn(`oMLX: could not free enough for "${requested}" (need ${need}, free ${free}); proxying anyway`);
+  if (free < need) {
+    // Fail closed: room could have been made, but a non-pinned model wouldn't go
+    // idle within OMLX_UNLOAD_IDLE_TIMEOUT_MS, so forwarding now would risk an OOM
+    // on the oMLX host. Return 503 (handled upstream) instead of proxying anyway.
+    if (fitAchievable)
+      throw new OmlxError(`could not free enough for "${requested}" in time (need ${need}, free ${free}); a busy model wouldn't go idle within ${IDLE_TIMEOUT}ms`);
+    // Unloading every non-pinned model still wouldn't fit — blocked by pinned
+    // models (or the model is too large for the ceiling). Proxy as-is per policy.
+    console.warn(`oMLX: "${requested}" cannot fit even after unloading all non-pinned models (need ${need}, free ${free}); proxying anyway`);
+  }
 };
 
 createServer((req, res) => {
