@@ -18,14 +18,22 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 // loaded and how much memory is free, and proactively unload other models so
 // the requested one fits. All three oMLX calls are bearer-authed, so we just
 // send OMLX_API_KEY:
-//   GET  /v1/models/status       - per-model loaded/pinned/size/last_access/alias
-//   GET  /api/status             - memory ceiling/usage + active/waiting requests
+//   GET  /v1/models/status       - per-model loaded/pinned/size/alias, AND the
+//                                  whole-server final_ceiling + current_model_memory
+//                                  (one snapshot => consistent memory accounting)
+//   GET  /api/status             - server-wide active/waiting request counts (idle gate)
 //   POST /v1/models/{id}/unload  - unload a model (immediate abort, hence idle-wait)
 //
 // Policy (per project requirements):
 //   - Unload the least-recently-used *non-pinned* models, one at a time, only
 //     until the requested model fits. Pinned models are never touched; if only
 //     pinned models block the fit, we proxy as-is and let oMLX cope.
+//   - Admit loads one at a time and reserve their memory. oMLX's reported usage
+//     lags while a model loads (seconds), so two requests arriving together would
+//     each see free RAM and both be waved through, overcommitting the ceiling. We
+//     serialize admission and, once a model is admitted, count its size against
+//     free RAM until oMLX reports it loaded — so the next admission sees the
+//     pending load and unloads (or fails closed) accordingly.
 //   - NEVER abort an in-flight request. oMLX's unload is an *immediate abort*:
 //     it kills whatever that model is generating. oMLX only reports request
 //     counts SERVER-WIDE (active_requests + waiting_requests in /api/status) —
@@ -57,6 +65,41 @@ const IDLE_POLL = Number(OMLX_IDLE_POLL_MS);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// Serialize load-admission. Two requests arriving close together would otherwise
+// each read oMLX's current memory, each see the model fits, and both get waved
+// through — overcommitting the ceiling once both models load (a time-of-check/
+// time-of-use race). Only admissions that may load/unload take this lock;
+// requests for already-loaded models skip it, so serving latency is unaffected.
+let admitChain = Promise.resolve();
+const withAdmitLock = fn => {
+  const run = admitChain.then(fn, fn);
+  admitChain = run.then(() => {}, () => {}); // keep the chain alive past rejections
+  return run;
+};
+
+// Memory the proxy has admitted for models that are loading but which oMLX's
+// current_model_memory doesn't reflect yet (loads take seconds). Keyed by model id
+// -> { size, count }; ref-counted so concurrent requests for the same model
+// reserve its size once. A reservation counts against free RAM until oMLX reports
+// the model loaded (then used covers it), and is released when the request ends.
+const reservations = new Map();
+const reserve = (id, size) => {
+  const r = reservations.get(id) || { size, count: 0 };
+  r.size = size; r.count++; reservations.set(id, r);
+};
+const releaseReservation = id => {
+  const r = reservations.get(id);
+  if (r && --r.count <= 0) reservations.delete(id);
+};
+// Reserved bytes for still-loading models, excluding `exceptId` (the model whose
+// fit we're checking) and any model oMLX already counts in used (loadedIds).
+const reservedBytes = (exceptId, loadedIds) => {
+  let total = 0;
+  for (const [id, r] of reservations)
+    if (id !== exceptId && !loadedIds.has(id)) total += r.size;
+  return total;
+};
+
 class OmlxError extends Error {}
 // Thrown when a management endpoint 404s — i.e. the upstream isn't oMLX. Unlike
 // OmlxError (which fails closed), this disables memory management and proxies.
@@ -86,20 +129,24 @@ const omlxRequest = (method, path, json) => new Promise((resolve, reject) => {
   r.end();
 });
 
-// GET /v1/models/status lists every discoverable model with its loaded/pinned
-// state, size, last_access, and alias (model_alias, present when configured).
-const listModels = async () => {
+// GET /v1/models/status is the single source of truth for the memory decision: it
+// returns every model's loaded/pinned state, size, last_access and alias, AND the
+// whole-server memory picture in the same snapshot — final_ceiling (the ceiling
+// oMLX's memory_guard actually enforces, in bytes; null == no limit) and
+// current_model_memory (bytes in use). Reading loaded-state and usage from one
+// response keeps them consistent: a model is counted via current_model_memory XOR
+// via a reservation, never both and never neither, so we can't double-count or
+// undercount across a reserved->loaded transition.
+const fetchState = async () => {
   const res = await omlxRequest("GET", "/v1/models/status");
   if (res.status === 404) throw new NotOmlx();
   const models = res.data?.models;
   if (res.status !== 200 || !Array.isArray(models)) throw new OmlxError(`oMLX GET /v1/models/status failed (HTTP ${res.status})`);
-  return models;
+  return { models, ceiling: res.data.final_ceiling, used: res.data.current_model_memory || 0 };
 };
 
-// GET /api/status reports the memory ceiling oMLX enforces (model_memory_max)
-// and current usage (model_memory_used), in bytes (max is null == no limit), plus
-// the SERVER-WIDE active_requests (generations in flight) and waiting_requests
-// (queued) counts. These are not broken down per model.
+// GET /api/status carries the SERVER-WIDE active_requests (generations in flight)
+// and waiting_requests (queued) counts — used only for the idle gate below.
 const serverStatus = async () => {
   const res = await omlxRequest("GET", "/api/status");
   if (res.status === 404) throw new NotOmlx();
@@ -115,16 +162,13 @@ const serverIdle = s => Number(s.active_requests) === 0 && Number(s.waiting_requ
 
 // Wait until oMLX reports a fully idle server (so an immediate-abort unload can't
 // kill anything), re-polling /api/status up to OMLX_UNLOAD_IDLE_TIMEOUT_MS.
-// Returns the last status seen so the caller can recompute free memory from it.
 const waitForServerIdle = async () => {
   const deadline = Date.now() + IDLE_TIMEOUT;
-  let s = await serverStatus();
-  while (!serverIdle(s)) {
-    if (Date.now() >= deadline) return null;
+  while (!serverIdle(await serverStatus())) {
+    if (Date.now() >= deadline) return false;
     await sleep(IDLE_POLL);
-    s = await serverStatus();
   }
-  return s;
+  return true;
 };
 
 const unload = async id => {
@@ -140,55 +184,77 @@ const lastAccess = m => (typeof m.last_access === "number" ? m.last_access : Dat
 // surfaces it as model_alias on the entry.
 const namesOf = m => [m.id, m.model_alias].filter(Boolean);
 
-// Ensure `requested` fits, unloading LRU non-pinned models as needed.
-// Throws OmlxError on any condition that prevents a confident decision.
+// Ensure `requested` fits, unloading LRU non-pinned models as needed. Returns the
+// model id reserved for this request (to release when it ends), or null if nothing
+// was reserved. Throws OmlxError on any condition that prevents a confident decision.
 const ensureFits = async requested => {
-  const models = await listModels();
+  const { models } = await fetchState(); // also probes for oMLX (throws NotOmlx on 404)
   const lc = String(requested).toLowerCase();
   const want = models.find(m => namesOf(m).includes(requested))
     || models.find(m => namesOf(m).some(n => String(n).toLowerCase() === lc));
   if (!want) throw new OmlxError(`model "${requested}" not known to oMLX`);
-  if (want.loaded) return; // already resident — nothing to do
+  if (want.loaded) return null; // already resident — nothing to reserve or unload
 
-  const status = await serverStatus();
-  if (status.model_memory_max == null) return; // oMLX is running unlimited — let it manage
-  const freeFrom = s => s.model_memory_max - (s.model_memory_used || 0);
-  let free = freeFrom(status);
+  // A load (and any unload it needs) must happen one at a time, with the resulting
+  // memory reserved before the next admission runs — otherwise concurrent requests
+  // overcommit the ceiling. Re-fetch state inside the lock; it may have changed.
+  return withAdmitLock(async () => {
+    const st = await fetchState();
+    const w = st.models.find(m => m.id === want.id) || want;
+    if (w.loaded) return null; // loaded while we waited for the lock
+    if (st.ceiling == null) return null; // oMLX is running unlimited — let it manage
 
-  const need = (want.estimated_size || 0) + HEADROOM;
-  if (free >= need) return;
+    // Free RAM = ceiling − used − memory already promised to other in-flight loads.
+    // `used` and the loaded flags come from the same snapshot, so a model is counted
+    // once (via `used`) or as a reservation, never both — no double/under-count.
+    const loadedIds = new Set(st.models.filter(m => m.loaded).map(m => m.id));
+    const freeNoResv = st.ceiling - st.used;
+    const reserved = reservedBytes(w.id, loadedIds);
+    let free = freeNoResv - reserved;
 
-  const victims = models
-    .filter(m => m.loaded && !m.pinned && m.id !== want.id)
-    .sort((a, b) => lastAccess(a) - lastAccess(b)); // oldest first
+    const need = (w.estimated_size || 0) + HEADROOM;
+    if (free >= need) { reserve(w.id, w.estimated_size || 0); return w.id; }
 
-  // If unloading every non-pinned victim still wouldn't free enough, the fit is
-  // blocked by pinned models (or the model is simply too big for the ceiling).
-  // Unloading can't help, so per policy proxy as-is and let oMLX cope.
-  if (free + victims.reduce((sum, v) => sum + sizeOf(v), 0) < need) {
-    console.warn(`oMLX: "${requested}" cannot fit even after unloading all non-pinned models (need ${need}, free ${free}); proxying anyway`);
-    return;
-  }
+    const victims = st.models
+      .filter(m => m.loaded && !m.pinned && m.id !== w.id)
+      .sort((a, b) => lastAccess(a) - lastAccess(b)); // oldest first
+    const reclaimable = victims.reduce((sum, v) => sum + sizeOf(v), 0);
 
-  // The fit IS achievable by unloading non-pinned models — but oMLX's unload is an
-  // immediate abort, so we must not unload while anything is generating. Wait for
-  // the whole server to go idle (no per-model busy flag exists). If it won't go
-  // idle in time, fail closed rather than abort an in-flight request or OOM.
-  const idle = await waitForServerIdle();
-  if (!idle) {
-    console.warn(`oMLX: server still busy after ${IDLE_TIMEOUT}ms; not unloading for "${requested}"`);
-    throw new OmlxError(`could not free enough for "${requested}" in time (need ${need}); oMLX did not go idle within ${IDLE_TIMEOUT}ms, and unloading now would abort an in-flight request`);
-  }
+    if (free + reclaimable < need) {
+      // Can't fit even after unloading every non-pinned victim. If it WOULD fit
+      // were it not for memory promised to other in-flight loads, the conflict is
+      // transient — fail closed so the client retries once those loads settle.
+      if (freeNoResv + reclaimable >= need)
+        throw new OmlxError(`"${requested}" can't fit yet: ${reserved} bytes are reserved for other in-flight model loads; retry shortly`);
+      // Genuinely blocked — by pinned models, or the model is too big for the
+      // ceiling. Unloading can't help, so proxy as-is (unreserved) and let oMLX cope.
+      console.warn(`oMLX: "${requested}" cannot fit even after unloading all non-pinned models (need ${need}, free ${free}); proxying anyway`);
+      return null;
+    }
 
-  // Server is idle: every loaded model is quiescent, so unloading the LRU victims
-  // can't interrupt anyone. Recompute free from the idle snapshot (usage may have
-  // changed while we waited), then unload oldest-first until the request fits.
-  free = freeFrom(idle);
-  for (const v of victims) {
-    if (free >= need) break;
-    await unload(v.id);
-    free += sizeOf(v);
-  }
+    // The fit IS achievable by unloading non-pinned models — but oMLX's unload is an
+    // immediate abort, so we must not unload while anything is generating. Wait for
+    // the whole server to go idle (no per-model busy flag exists). If it won't go
+    // idle in time, fail closed rather than abort an in-flight request or OOM.
+    if (!(await waitForServerIdle())) {
+      console.warn(`oMLX: server still busy after ${IDLE_TIMEOUT}ms; not unloading for "${requested}"`);
+      throw new OmlxError(`could not free enough for "${requested}" in time (need ${need}); oMLX did not go idle within ${IDLE_TIMEOUT}ms, and unloading now would abort an in-flight request`);
+    }
+
+    // Server is idle: every loaded model is quiescent, so unloading the LRU victims
+    // can't interrupt anyone. Recompute free from a fresh snapshot (usage may have
+    // changed while we waited), then unload oldest-first until the request fits.
+    const after = await fetchState();
+    const afterLoaded = new Set(after.models.filter(m => m.loaded).map(m => m.id));
+    free = after.ceiling - after.used - reservedBytes(w.id, afterLoaded);
+    for (const v of victims) {
+      if (free >= need) break;
+      await unload(v.id);
+      free += sizeOf(v);
+    }
+    reserve(w.id, w.estimated_size || 0);
+    return w.id;
+  });
 };
 
 createServer((req, res) => {
@@ -208,9 +274,10 @@ createServer((req, res) => {
       }
     } catch {}
 
+    let reservedId = null; // memory reserved for this request's pending load, if any
     if (MEMORY_MGMT && omlxDetected !== false && req.method === "POST" && typeof payload?.model === "string") {
       try {
-        await ensureFits(payload.model);
+        reservedId = await ensureFits(payload.model);
         omlxDetected = true;
       } catch (e) {
         if (e instanceof NotOmlx) {
@@ -237,12 +304,17 @@ createServer((req, res) => {
     if (OMLX_API_KEY && !headers.authorization && !headers["x-api-key"])
       headers.authorization = `Bearer ${OMLX_API_KEY}`;
 
+    // Release the memory reservation once the request settles: by then the model
+    // has loaded (oMLX's used now covers it) or the load failed (no RAM taken).
+    let released = false;
+    const release = () => { if (released) return; released = true; if (reservedId) releaseReservation(reservedId); };
+
     const upstream = request(`http://${MLX_HOST}:${MLX_PORT}${req.url}`,
       { method: req.method, headers, agent: false },
-      r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+      r => { res.writeHead(r.statusCode, r.headers); r.on("end", release); r.pipe(res); });
 
-    upstream.on("error", e => { console.error(e.message); if (!res.headersSent) res.writeHead(502).end(); });
-    res.on("close", () => { if (!res.writableEnded) upstream.destroy(); });
+    upstream.on("error", e => { console.error(e.message); release(); if (!res.headersSent) res.writeHead(502).end(); });
+    res.on("close", () => { if (!res.writableEnded) upstream.destroy(); release(); });
     upstream.end(body);
   });
 }).listen(MLX_PROXY_PORT, () => console.log(`:${MLX_PROXY_PORT} → ${MLX_HOST}:${MLX_PORT}${MEMORY_MGMT ? " (oMLX memory mgmt on)" : ""}`));

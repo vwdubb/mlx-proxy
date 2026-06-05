@@ -34,17 +34,33 @@ When it is active, any `POST` whose JSON body names a `model` runs a memory chec
 first. All oMLX calls are bearer-authed, so the key is simply sent as
 `Authorization: Bearer …` — no admin session/cookie needed.
 
-1. **Inspect** — `GET /v1/models/status` for each model's loaded/pinned state,
-   size, last-access, and alias; and `GET /api/status` for the memory ceiling oMLX
-   enforces (`model_memory_max`), current usage (`model_memory_used`), so
-   free = ceiling − used, and the server-wide `active_requests`/`waiting_requests`
-   counts. (If oMLX runs with no ceiling, the check is skipped.)
+1. **Inspect** — `GET /v1/models/status` is the single source of truth for the
+   memory decision: each model's loaded/pinned state, size and alias, **and** the
+   whole-server `final_ceiling` (the ceiling oMLX's `memory_guard` actually
+   enforces) and `current_model_memory` (bytes in use), so free = ceiling − used.
+   Taking loaded-state and usage from one snapshot keeps them consistent. (If oMLX
+   reports no ceiling, the check is skipped.) `GET /api/status` is consulted
+   separately only for the server-wide `active_requests`/`waiting_requests` counts.
 2. **Decide & unload** — if the requested model's estimated size plus a headroom
    margin won't fit in free RAM, unload the **least-recently-used non-pinned**
    models one at a time, only until it fits. But first **wait for the server to go
    idle** (see below): oMLX's unload is an *immediate abort* that cancels whatever
    the model is generating, so the proxy never unloads while anything is in flight.
 3. **Proxy** — forward the request as normal.
+
+### Concurrent loads
+
+The fit check is meaningless if two requests can pass it at the same time: each
+would read oMLX's current usage, each see its model fit, and both get forwarded —
+overcommitting the ceiling once both load (oMLX then rejects one with a memory
+error, which is exactly the failure this guards against). oMLX's reported usage
+also *lags* by several seconds while a model loads, widening the window. So the
+proxy **serializes load-admission** (requests for already-loaded models skip this
+and aren't slowed) and, the moment it admits a model, **reserves that model's
+size**, counting it against free RAM until oMLX reports the model loaded. A
+concurrent admission therefore sees the pending load and unloads for it — or, if
+nothing can be freed because the blocker is itself an in-flight load, **fails
+closed with `503` ("retry shortly")** so the client retries once it settles.
 
 ### Waiting for idle
 
@@ -86,8 +102,9 @@ abort an in-flight request or forward into a likely out-of-memory.
   feature and proxies normally.)
 - **RAM is read from oMLX itself,** not the proxy's host. The proxy typically
   runs in a container on a different machine than oMLX, so it relies on oMLX's
-  enforced memory ceiling from `/api/status` (which already reserves headroom to
-  prevent system-wide OOM).
+  enforced ceiling (`final_ceiling` from `/v1/models/status`, the value oMLX's
+  `memory_guard` actually applies — already reserving headroom to prevent
+  system-wide OOM).
 
 > **Note:** oMLX already performs LRU eviction and enforces a total-memory limit
 > on its own. This proxy logic is proactive belt-and-suspenders. Because
