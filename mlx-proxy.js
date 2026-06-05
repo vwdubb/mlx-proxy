@@ -131,13 +131,17 @@ const unload = async id => {
 
 const sizeOf = m => (m.actual_size > 0 ? m.actual_size : m.estimated_size) || 0;
 const lastAccess = m => (typeof m.last_access === "number" ? m.last_access : Date.parse(m.last_access)) || 0;
+// oMLX accepts either the directory id or the configured alias; /v1/models
+// advertises the alias when set, so requests usually carry it.
+const namesOf = m => [m.id, m.settings?.model_alias].filter(Boolean);
 
 // Ensure `requested` fits, unloading LRU non-pinned models as needed.
 // Throws AdminError on any condition that prevents a confident decision.
 const ensureFits = async requested => {
   const models = await listModels();
-  const want = models.find(m => m.id === requested)
-    || models.find(m => String(m.id).toLowerCase() === String(requested).toLowerCase());
+  const lc = String(requested).toLowerCase();
+  const want = models.find(m => namesOf(m).includes(requested))
+    || models.find(m => namesOf(m).some(n => String(n).toLowerCase() === lc));
   if (!want) throw new AdminError(`model "${requested}" not known to oMLX`);
   if (want.loaded) return; // already resident — nothing to do
 
