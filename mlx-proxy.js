@@ -1,7 +1,7 @@
 import { createServer, request } from "http";
 const {
   MLX_HOST = "host.docker.internal", MLX_PORT = 8080, MLX_PROXY_PORT = 8081, TZ = "UTC",
-  OMLX_API_KEY = "", OMLX_HEADROOM_MB = "1024", OMLX_ADMIN_TIMEOUT_MS = "5000",
+  OMLX_API_KEY = "", OMLX_HEADROOM_MB = "1024", OMLX_API_TIMEOUT_MS = "5000",
   OMLX_UNLOAD_IDLE_TIMEOUT_MS = "30000", OMLX_IDLE_POLL_MS = "250",
 } = process.env;
 
@@ -16,9 +16,11 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 //
 // Before proxying a request that names a model, ask oMLX which models are
 // loaded and how much memory is free, and proactively unload other models so
-// the requested one fits. The admin/status/unload endpoints require an admin
-// *session cookie* (not a bearer key), so we exchange OMLX_API_KEY for a
-// cookie via POST /admin/api/login and reuse it.
+// the requested one fits. All three oMLX calls are bearer-authed, so we just
+// send OMLX_API_KEY:
+//   GET  /v1/models/status       - per-model loaded/pinned/size/last_access/alias
+//   GET  /api/status             - enforced memory ceiling + current usage
+//   POST /v1/models/{id}/unload  - unload a model (hard abort, hence idle-wait)
 //
 // Policy (per project requirements):
 //   - Unload the least-recently-used *non-pinned* models, one at a time, only
@@ -29,8 +31,8 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 //     requests THIS proxy has in flight per model and don't unload a model
 //     until its in-flight count drops to zero. If it stays busy past
 //     OMLX_UNLOAD_IDLE_TIMEOUT_MS, we leave it loaded and move on.
-//   - Fail closed: if the memory check itself can't be completed (admin
-//     unreachable, bad/again-missing key, unexpected response, unknown model),
+//   - Fail closed: if the memory check itself can't be completed (oMLX
+//     unreachable, bad/missing key, unexpected response, unknown model),
 //     return 503 rather than risk an OOM on the oMLX host.
 //
 // Enabled only when OMLX_API_KEY is set; otherwise the proxy behaves as a
@@ -38,120 +40,92 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 // ---------------------------------------------------------------------------
 const MEMORY_MGMT = OMLX_API_KEY.length > 0;
 const HEADROOM = Number(OMLX_HEADROOM_MB) * 1024 * 1024;
-const ADMIN_TIMEOUT = Number(OMLX_ADMIN_TIMEOUT_MS);
+const REQ_TIMEOUT = Number(OMLX_API_TIMEOUT_MS);
 const IDLE_TIMEOUT = Number(OMLX_UNLOAD_IDLE_TIMEOUT_MS);
 const IDLE_POLL = Number(OMLX_IDLE_POLL_MS);
 
-// Requests currently being proxied, counted per model id, so we can wait for a
-// model to drain before unloading it.
+// Requests currently being proxied, counted under the (lower-cased) model name
+// the client sent — which may be a directory id OR an alias — so we can wait for
+// a model to drain before unloading it. A victim is "busy" if any of its names
+// (id or alias) has in-flight requests.
 const inflight = new Map();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const waitForIdle = async id => {
+const busy = names => names.some(n => (inflight.get(String(n).toLowerCase()) || 0) > 0);
+const waitForIdle = async names => {
   const deadline = Date.now() + IDLE_TIMEOUT;
-  while ((inflight.get(id) || 0) > 0) {
+  while (busy(names)) {
     if (Date.now() >= deadline) return false;
     await sleep(IDLE_POLL);
   }
   return true;
 };
 
-class AdminError extends Error {}
+class OmlxError extends Error {}
 
-let session = { cookie: null, expires: 0 };
-let loginInFlight = null;
-
-const adminRequest = (method, path, { cookie, json } = {}) => new Promise((resolve, reject) => {
+// Every oMLX call we make is bearer-authed (verify_api_key), so we just send
+// OMLX_API_KEY — no admin session/login/cookie needed.
+const omlxRequest = (method, path, json) => new Promise((resolve, reject) => {
   const body = json ? Buffer.from(JSON.stringify(json)) : null;
-  const headers = {};
+  const headers = { authorization: `Bearer ${OMLX_API_KEY}` };
   if (body) { headers["content-type"] = "application/json"; headers["content-length"] = body.length; }
-  if (cookie) headers.cookie = `omlx_admin_session=${cookie}`;
   const r = request(`http://${MLX_HOST}:${MLX_PORT}${path}`, { method, headers, agent: false }, resp => {
     const chunks = [];
     resp.on("data", c => chunks.push(c));
     resp.on("end", () => {
-      const text = Buffer.concat(chunks).toString("utf8");
       let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch {}
-      resolve({ status: resp.statusCode, headers: resp.headers, data });
+      try { const t = Buffer.concat(chunks).toString("utf8"); data = t ? JSON.parse(t) : null; } catch {}
+      resolve({ status: resp.statusCode, data });
     });
   });
   r.on("error", reject);
-  r.setTimeout(ADMIN_TIMEOUT, () => r.destroy(new AdminError(`oMLX admin ${method} ${path} timed out`)));
+  r.setTimeout(REQ_TIMEOUT, () => r.destroy(new OmlxError(`oMLX ${method} ${path} timed out`)));
   if (body) r.write(body);
   r.end();
 });
 
-const login = async () => {
-  const res = await adminRequest("POST", "/admin/api/login", { json: { api_key: OMLX_API_KEY, remember: true } });
-  if (res.status !== 200) throw new AdminError(`oMLX admin login failed (HTTP ${res.status})`);
-  const raw = [].concat(res.headers["set-cookie"] || []).find(c => c.startsWith("omlx_admin_session="));
-  if (!raw) throw new AdminError("oMLX admin login returned no session cookie");
-  const cookie = raw.split(";")[0].slice("omlx_admin_session=".length);
-  const maxAge = /max-age=(\d+)/i.exec(raw);
-  const ttl = maxAge ? Number(maxAge[1]) * 1000 : 3600_000;
-  session = { cookie, expires: Date.now() + ttl - 60_000 };
-  return cookie;
-};
-
-const getCookie = () => {
-  if (session.cookie && Date.now() < session.expires) return Promise.resolve(session.cookie);
-  if (!loginInFlight) loginInFlight = login().finally(() => { loginInFlight = null; });
-  return loginInFlight;
-};
-
-// GET/POST an admin endpoint, transparently re-logging-in once on a 401.
-const adminCall = async (method, path, json) => {
-  let res = await adminRequest(method, path, { cookie: await getCookie(), json });
-  if (res.status === 401) {
-    session = { cookie: null, expires: 0 };
-    res = await adminRequest(method, path, { cookie: await getCookie(), json });
-  }
-  return res;
-};
-
+// GET /v1/models/status lists every discoverable model with its loaded/pinned
+// state, size, last_access, and alias (model_alias, present when configured).
 const listModels = async () => {
-  const res = await adminCall("GET", "/admin/api/models");
-  const models = Array.isArray(res.data) ? res.data : res.data?.models;
-  if (res.status !== 200 || !Array.isArray(models)) throw new AdminError(`oMLX GET /admin/api/models failed (HTTP ${res.status})`);
+  const res = await omlxRequest("GET", "/v1/models/status");
+  const models = res.data?.models;
+  if (res.status !== 200 || !Array.isArray(models)) throw new OmlxError(`oMLX GET /v1/models/status failed (HTTP ${res.status})`);
   return models;
 };
 
-const systemMemory = async () => {
-  const res = await adminCall("GET", "/admin/api/system-status");
-  const mem = res.data?.memory ?? res.data;
-  if (res.status !== 200 || !mem) throw new AdminError(`oMLX GET /admin/api/system-status failed (HTTP ${res.status})`);
-  return mem;
+// GET /api/status reports the memory ceiling oMLX enforces (model_memory_max)
+// and current usage (model_memory_used), in bytes. max is null == no limit.
+const serverStatus = async () => {
+  const res = await omlxRequest("GET", "/api/status");
+  if (res.status !== 200 || !res.data) throw new OmlxError(`oMLX GET /api/status failed (HTTP ${res.status})`);
+  return res.data;
 };
 
 const unload = async id => {
-  const res = await adminCall("POST", `/admin/api/models/${encodeURIComponent(id)}/unload`);
-  // 404 == already unloaded; anything else non-2xx is a real failure.
-  if (res.status !== 200 && res.status !== 204 && res.status !== 404) throw new AdminError(`oMLX unload "${id}" failed (HTTP ${res.status})`);
+  const res = await omlxRequest("POST", `/v1/models/${encodeURIComponent(id)}/unload`);
+  // 404 (not found) / 400 (not loaded) both mean it's already gone — fine.
+  if (![200, 204, 400, 404].includes(res.status)) throw new OmlxError(`oMLX unload "${id}" failed (HTTP ${res.status})`);
 };
 
 const sizeOf = m => (m.actual_size > 0 ? m.actual_size : m.estimated_size) || 0;
 const lastAccess = m => (typeof m.last_access === "number" ? m.last_access : Date.parse(m.last_access)) || 0;
 // oMLX accepts either the directory id or the configured alias; /v1/models
-// advertises the alias when set, so requests usually carry it.
-const namesOf = m => [m.id, m.settings?.model_alias].filter(Boolean);
+// advertises the alias when set, so requests usually carry it. /v1/models/status
+// surfaces it as model_alias on the entry.
+const namesOf = m => [m.id, m.model_alias].filter(Boolean);
 
 // Ensure `requested` fits, unloading LRU non-pinned models as needed.
-// Throws AdminError on any condition that prevents a confident decision.
+// Throws OmlxError on any condition that prevents a confident decision.
 const ensureFits = async requested => {
   const models = await listModels();
   const lc = String(requested).toLowerCase();
   const want = models.find(m => namesOf(m).includes(requested))
     || models.find(m => namesOf(m).some(n => String(n).toLowerCase() === lc));
-  if (!want) throw new AdminError(`model "${requested}" not known to oMLX`);
+  if (!want) throw new OmlxError(`model "${requested}" not known to oMLX`);
   if (want.loaded) return; // already resident — nothing to do
 
-  const mem = await systemMemory();
-  let free = typeof mem.available_bytes === "number"
-    ? mem.available_bytes
-    : typeof mem.auto_limit_bytes === "number"
-      ? mem.auto_limit_bytes - models.filter(m => m.loaded).reduce((s, m) => s + sizeOf(m), 0)
-      : null;
-  if (free === null) throw new AdminError("oMLX system-status missing memory fields");
+  const status = await serverStatus();
+  if (status.model_memory_max == null) return; // oMLX is running unlimited — let it manage
+  let free = status.model_memory_max - (status.model_memory_used || 0);
 
   const need = (want.estimated_size || 0) + HEADROOM;
   if (free >= need) return;
@@ -161,7 +135,7 @@ const ensureFits = async requested => {
     .sort((a, b) => lastAccess(a) - lastAccess(b)); // oldest first
   for (const v of victims) {
     if (free >= need) break;
-    if (!(await waitForIdle(v.id))) {
+    if (!(await waitForIdle(namesOf(v)))) {
       console.warn(`oMLX: "${v.id}" still serving requests after ${IDLE_TIMEOUT}ms; leaving it loaded`);
       continue;
     }
@@ -192,7 +166,7 @@ createServer((req, res) => {
       try {
         await ensureFits(payload.model);
       } catch (e) {
-        const detail = e instanceof AdminError ? e.message : `oMLX memory check error: ${e.message}`;
+        const detail = e instanceof OmlxError ? e.message : `oMLX memory check error: ${e.message}`;
         console.error(detail);
         if (!res.headersSent) {
           res.writeHead(503, { "content-type": "application/json" });
@@ -205,9 +179,10 @@ createServer((req, res) => {
     const headers = { ...req.headers, host: `${MLX_HOST}:${MLX_PORT}`, "content-length": body.length };
     delete headers["transfer-encoding"];
 
-    // Count this request against its model while it's in flight, so the memory
-    // logic can wait for a model to go idle before unloading it.
-    const model = MEMORY_MGMT && typeof payload?.model === "string" ? payload.model : null;
+    // Count this request against its model (lower-cased, as sent) while it's in
+    // flight, so the memory logic can wait for a model to go idle before
+    // unloading it. namesOf() checks both a model's id and alias against this.
+    const model = MEMORY_MGMT && typeof payload?.model === "string" ? payload.model.toLowerCase() : null;
     if (model) inflight.set(model, (inflight.get(model) || 0) + 1);
     let released = false;
     const release = () => {

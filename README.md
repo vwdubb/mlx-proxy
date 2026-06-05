@@ -14,26 +14,26 @@ The proxy is a single dependency-free file (`mlx-proxy.js`, Node 22+).
 ## How it works
 
 ```
-client ──▶ mlx-proxy ──▶ oMLX (/v1/* inference + /admin/api/* management)
+client ──▶ mlx-proxy ──▶ oMLX (/v1/* inference + management)
 ```
 
 For every request the proxy injects the date/time into the last user message and
 forwards it upstream unchanged.
 
 When `OMLX_API_KEY` is set, any `POST` whose JSON body names a `model` also runs a
-memory check first:
+memory check first. All oMLX calls are bearer-authed, so the key is simply sent as
+`Authorization: Bearer …` — no admin session/cookie needed.
 
-1. **Authenticate** — exchanges `OMLX_API_KEY` for an admin session cookie via
-   `POST /admin/api/login`. oMLX's status and unload endpoints require a session
-   cookie (not a bearer key), so the key is logged in once and the cookie cached
-   (re-acquired automatically on a `401`).
-2. **Inspect** — `GET /admin/api/models` for the loaded/pinned state and size of
-   each model, and `GET /admin/api/system-status` for free RAM.
-3. **Decide & unload** — if the requested model's estimated size plus a headroom
+1. **Inspect** — `GET /v1/models/status` for each model's loaded/pinned state,
+   size, last-access, and alias; and `GET /api/status` for the memory ceiling oMLX
+   enforces (`model_memory_max`) and current usage (`model_memory_used`), so
+   free = ceiling − used. (If oMLX runs with no ceiling, the check is skipped.)
+2. **Decide & unload** — if the requested model's estimated size plus a headroom
    margin won't fit in free RAM, unload the **least-recently-used non-pinned**
    models one at a time, only until it fits. Before unloading a model, **wait for
-   it to go idle** (see below) so in-flight requests aren't interrupted.
-4. **Proxy** — forward the request as normal.
+   it to go idle** (see below) so in-flight requests aren't interrupted —
+   oMLX's unload is a hard abort that cancels active generations.
+3. **Proxy** — forward the request as normal.
 
 ### Waiting for idle
 
@@ -53,12 +53,13 @@ proxies as-is if nothing could be freed).
 
 - **Pinned models are never unloaded.** If only pinned models are blocking the
   fit, the proxy forwards the request as-is and lets oMLX handle it.
-- **Fails closed.** If the memory check can't be completed — oMLX admin
-  unreachable, missing/invalid key, unexpected response, or an unknown model —
-  the proxy returns `503` rather than risk an out-of-memory on the oMLX host.
+- **Fails closed.** If the memory check can't be completed — oMLX unreachable,
+  missing/invalid key, unexpected response, or an unknown model — the proxy
+  returns `503` rather than risk an out-of-memory on the oMLX host.
 - **RAM is read from oMLX itself,** not the proxy's host. The proxy typically
   runs in a container on a different machine than oMLX, so it relies on oMLX's
-  `system-status` (which already reserves headroom to prevent system-wide OOM).
+  enforced memory ceiling from `/api/status` (which already reserves headroom to
+  prevent system-wide OOM).
 
 > **Note:** oMLX already performs LRU eviction and enforces a total-memory limit
 > on its own. This proxy logic is proactive belt-and-suspenders. Because
@@ -72,12 +73,12 @@ All configuration is via environment variables.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `MLX_HOST` | `host.docker.internal` | Upstream oMLX host. |
-| `MLX_PORT` | `8080` | Upstream oMLX port (inference **and** admin API). |
+| `MLX_PORT` | `8080` | Upstream oMLX port. |
 | `MLX_PROXY_PORT` | `8081` | Port the proxy listens on. |
 | `TZ` | `UTC` | Timezone used for the injected date/time. |
-| `OMLX_API_KEY` | *(empty)* | oMLX admin/API key. **Set this to enable memory management;** leave empty for plain pass-through. |
+| `OMLX_API_KEY` | *(empty)* | oMLX API key (`omlx serve --api-key …`). **Set this to enable memory management;** leave empty for plain pass-through. |
 | `OMLX_HEADROOM_MB` | `1024` | Free-RAM safety margin (MB) required on top of the model's estimated size. |
-| `OMLX_ADMIN_TIMEOUT_MS` | `5000` | Timeout for each oMLX admin API call. |
+| `OMLX_API_TIMEOUT_MS` | `5000` | Timeout for each oMLX API call (model list, status, unload). |
 | `OMLX_UNLOAD_IDLE_TIMEOUT_MS` | `30000` | Max time to wait for a model to go idle before giving up on unloading it. |
 | `OMLX_IDLE_POLL_MS` | `250` | How often to re-check a model's in-flight count while waiting for idle. |
 
