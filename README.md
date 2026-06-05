@@ -31,8 +31,23 @@ memory check first:
    each model, and `GET /admin/api/system-status` for free RAM.
 3. **Decide & unload** — if the requested model's estimated size plus a headroom
    margin won't fit in free RAM, unload the **least-recently-used non-pinned**
-   models one at a time, only until it fits.
+   models one at a time, only until it fits. Before unloading a model, **wait for
+   it to go idle** (see below) so in-flight requests aren't interrupted.
 4. **Proxy** — forward the request as normal.
+
+### Waiting for idle
+
+Unloading a model that's mid-generation would interrupt whoever is using it. oMLX
+only exposes an *aggregate* active-request count (no per-model busy flag), so the
+proxy instead tracks the requests **it** has in flight per model. Before unloading
+a model it waits until that model's in-flight count drops to zero, polling every
+`OMLX_IDLE_POLL_MS`. If the model is still busy after `OMLX_UNLOAD_IDLE_TIMEOUT_MS`,
+the proxy leaves it loaded and moves on to the next candidate (and ultimately
+proxies as-is if nothing could be freed).
+
+> This covers traffic flowing **through the proxy** — which is the intended
+> deployment (clients point at the proxy). Requests sent to oMLX directly,
+> bypassing the proxy, are not visible to the idle check.
 
 ### Policy
 
@@ -63,6 +78,8 @@ All configuration is via environment variables.
 | `OMLX_API_KEY` | *(empty)* | oMLX admin/API key. **Set this to enable memory management;** leave empty for plain pass-through. |
 | `OMLX_HEADROOM_MB` | `1024` | Free-RAM safety margin (MB) required on top of the model's estimated size. |
 | `OMLX_ADMIN_TIMEOUT_MS` | `5000` | Timeout for each oMLX admin API call. |
+| `OMLX_UNLOAD_IDLE_TIMEOUT_MS` | `30000` | Max time to wait for a model to go idle before giving up on unloading it. |
+| `OMLX_IDLE_POLL_MS` | `250` | How often to re-check a model's in-flight count while waiting for idle. |
 
 ## Running
 

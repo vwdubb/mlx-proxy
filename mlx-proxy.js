@@ -2,6 +2,7 @@ import { createServer, request } from "http";
 const {
   MLX_HOST = "host.docker.internal", MLX_PORT = 8080, MLX_PROXY_PORT = 8081, TZ = "UTC",
   OMLX_API_KEY = "", OMLX_HEADROOM_MB = "1024", OMLX_ADMIN_TIMEOUT_MS = "5000",
+  OMLX_UNLOAD_IDLE_TIMEOUT_MS = "30000", OMLX_IDLE_POLL_MS = "250",
 } = process.env;
 
 const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -23,6 +24,11 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 //   - Unload the least-recently-used *non-pinned* models, one at a time, only
 //     until the requested model fits. Pinned models are never touched; if only
 //     pinned models block the fit, we proxy as-is and let oMLX cope.
+//   - Wait for a model to go idle before unloading it: oMLX exposes only an
+//     aggregate active-request count (no per-model busy flag), so we track the
+//     requests THIS proxy has in flight per model and don't unload a model
+//     until its in-flight count drops to zero. If it stays busy past
+//     OMLX_UNLOAD_IDLE_TIMEOUT_MS, we leave it loaded and move on.
 //   - Fail closed: if the memory check itself can't be completed (admin
 //     unreachable, bad/again-missing key, unexpected response, unknown model),
 //     return 503 rather than risk an OOM on the oMLX host.
@@ -33,6 +39,21 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
 const MEMORY_MGMT = OMLX_API_KEY.length > 0;
 const HEADROOM = Number(OMLX_HEADROOM_MB) * 1024 * 1024;
 const ADMIN_TIMEOUT = Number(OMLX_ADMIN_TIMEOUT_MS);
+const IDLE_TIMEOUT = Number(OMLX_UNLOAD_IDLE_TIMEOUT_MS);
+const IDLE_POLL = Number(OMLX_IDLE_POLL_MS);
+
+// Requests currently being proxied, counted per model id, so we can wait for a
+// model to drain before unloading it.
+const inflight = new Map();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const waitForIdle = async id => {
+  const deadline = Date.now() + IDLE_TIMEOUT;
+  while ((inflight.get(id) || 0) > 0) {
+    if (Date.now() >= deadline) return false;
+    await sleep(IDLE_POLL);
+  }
+  return true;
+};
 
 class AdminError extends Error {}
 
@@ -136,6 +157,10 @@ const ensureFits = async requested => {
     .sort((a, b) => lastAccess(a) - lastAccess(b)); // oldest first
   for (const v of victims) {
     if (free >= need) break;
+    if (!(await waitForIdle(v.id))) {
+      console.warn(`oMLX: "${v.id}" still serving requests after ${IDLE_TIMEOUT}ms; leaving it loaded`);
+      continue;
+    }
     await unload(v.id);
     free += sizeOf(v);
   }
@@ -176,12 +201,24 @@ createServer((req, res) => {
     const headers = { ...req.headers, host: `${MLX_HOST}:${MLX_PORT}`, "content-length": body.length };
     delete headers["transfer-encoding"];
 
+    // Count this request against its model while it's in flight, so the memory
+    // logic can wait for a model to go idle before unloading it.
+    const model = MEMORY_MGMT && typeof payload?.model === "string" ? payload.model : null;
+    if (model) inflight.set(model, (inflight.get(model) || 0) + 1);
+    let released = false;
+    const release = () => {
+      if (released || !model) return;
+      released = true;
+      const n = (inflight.get(model) || 1) - 1;
+      if (n > 0) inflight.set(model, n); else inflight.delete(model);
+    };
+
     const upstream = request(`http://${MLX_HOST}:${MLX_PORT}${req.url}`,
       { method: req.method, headers, agent: false },
-      r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+      r => { res.writeHead(r.statusCode, r.headers); r.on("end", release); r.pipe(res); });
 
-    upstream.on("error", e => { console.error(e.message); if (!res.headersSent) res.writeHead(502).end(); });
-    res.on("close", () => { if (!res.writableEnded) upstream.destroy(); });
+    upstream.on("error", e => { console.error(e.message); release(); if (!res.headersSent) res.writeHead(502).end(); });
+    res.on("close", () => { if (!res.writableEnded) upstream.destroy(); release(); });
     upstream.end(body);
   });
 }).listen(MLX_PROXY_PORT, () => console.log(`:${MLX_PROXY_PORT} → ${MLX_HOST}:${MLX_PORT}${MEMORY_MGMT ? " (oMLX memory mgmt on)" : ""}`));
