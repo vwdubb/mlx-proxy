@@ -1,8 +1,8 @@
 # mlx-proxy
 
-A tiny (~40 line, zero-dependency) HTTP reverse proxy that sits in front of an
+A small, zero-dependency HTTP reverse proxy that sits in front of an
 [MLX](https://github.com/ml-explore/mlx) / `mlx_lm.server` OpenAI-compatible
-endpoint and does two things:
+endpoint and does three things:
 
 1. **Injects the current date and time** into the latest user message of every
    chat request, so the model always knows "now" without you having to add it to
@@ -10,6 +10,8 @@ endpoint and does two things:
 2. **Optionally attaches an upstream API key** (`Authorization: Bearer …`) to
    every forwarded request, so you can point clients at the proxy without baking
    the key into each one.
+3. **Optionally syncs oMLX's `ssd_cache_dir` per model** (off by default), so
+   each model gets its own SSD cache directory before requests are forwarded.
 
 Everything else is passed through untouched, including streaming responses.
 
@@ -42,6 +44,8 @@ All configuration is via environment variables:
 | `MLX_PORT`       | `8080`                   | Port of the upstream MLX server.                                            |
 | `MLX_PROXY_PORT` | `8081`                   | Port the proxy listens on.                                                  |
 | `MLX_API_KEY`    | _(unset)_                | If set, sent to the upstream as `Authorization: Bearer <key>`. Unset = no auth header added (passthrough). |
+| `OMLX_CACHE_SYNC` | _(unset)_ | When truthy (`1`/`true`/`yes`/`on`), before forwarding any request that names a `model`, the proxy points oMLX's global `ssd_cache_dir` at `<OMLX_CACHE_ROOT>/<canonical-model-id>`, updating it only when it differs. Off = current behavior. |
+| `OMLX_CACHE_ROOT` | _(unset)_ | Root cache directory, e.g. `/Users/you/.omlx/cache`. Required when `OMLX_CACHE_SYNC` is on. |
 | `TZ`             | `UTC`                    | Timezone used to format the injected date/time (e.g. `America/Toronto`).    |
 
 ### About `MLX_API_KEY`
@@ -55,6 +59,31 @@ All configuration is via environment variables:
 - The key authenticates the proxy **to the upstream MLX server**; the proxy
   itself does not authenticate its own clients. If you need to restrict who can
   reach the proxy, put it on a trusted network or behind a gateway that does.
+- When `OMLX_CACHE_SYNC` is enabled, `MLX_API_KEY` must also have oMLX admin
+  rights — the proxy uses it to log in to the oMLX admin API.
+
+### About `OMLX_CACHE_SYNC`
+
+When enabled, the proxy keeps a separate SSD cache directory per model. Before
+forwarding a request that names a `model`, it:
+
+1. Resolves the model to its **canonical id** (aliases are mapped to the real id
+   via oMLX's admin `models` list — issue: alias calls otherwise reuse the wrong
+   per-model state).
+2. Reads oMLX's current global `ssd_cache_dir`.
+3. If it isn't already `<OMLX_CACHE_ROOT>/<canonical-id>`, updates it via the
+   admin API. Otherwise does nothing.
+
+It authenticates to the oMLX admin API by logging in with `MLX_API_KEY` (the
+same key must have admin rights) and reusing the session cookie.
+
+**Fail closed:** if the admin login/read/write fails, or the model can't be
+resolved, the proxy returns `502` and does **not** forward the request — a
+request never runs against the wrong cache directory.
+
+**Caveats:** `ssd_cache_dir` is a *global* oMLX setting, so this assumes one
+model is served at a time (concurrent calls to different models would race). The
+proxy does not trigger a model reload after changing the directory.
 
 ## Running
 
