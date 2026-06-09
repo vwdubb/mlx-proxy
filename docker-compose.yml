@@ -10,12 +10,8 @@ services:
       MLX_HOST: host.docker.internal
       MLX_PORT: 28080
       MLX_PROXY_PORT: 28081
-      MLX_API_KEY: your-upstream-key   # optional; must have oMLX admin rights when OMLX_CACHE_SYNC is on
       TZ: America/Toronto
-      # Per-model ssd_cache_dir sync (off by default). To enable, uncomment both and
-      # ensure MLX_API_KEY has oMLX admin rights and OMLX_CACHE_ROOT is a real path:
-      # OMLX_CACHE_SYNC: "1"
-      # OMLX_CACHE_ROOT: /Users/you/.omlx/cache
+      MLX_API_KEY: your-upstream-key   # optional
     extra_hosts:
       - "host.docker.internal:host-gateway"
     mem_limit: 4g
