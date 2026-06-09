@@ -1,5 +1,5 @@
 import { createServer, request } from "http";
-const { MLX_HOST = "host.docker.internal", MLX_PORT = 8080, MLX_PROXY_PORT = 8081, TZ = "UTC" } = process.env;
+const { MLX_HOST = "host.docker.internal", MLX_PORT = 8080, MLX_PROXY_PORT = 8081, MLX_API_KEY, TZ = "UTC" } = process.env;
 
 const fmt = new Intl.DateTimeFormat("en-CA", {
   timeZone: TZ, weekday: "long", year: "numeric", month: "long",
@@ -25,6 +25,7 @@ createServer((req, res) => {
 
     const headers = { ...req.headers, host: `${MLX_HOST}:${MLX_PORT}`, "content-length": body.length };
     delete headers["transfer-encoding"];
+    if (MLX_API_KEY) headers["authorization"] = `Bearer ${MLX_API_KEY}`;
 
     const upstream = request(`http://${MLX_HOST}:${MLX_PORT}${req.url}`,
       { method: req.method, headers, agent: false },

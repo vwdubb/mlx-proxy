@@ -7,10 +7,11 @@ services:
     ports:
       - 28081:28081
     environment:
-      MLX_HOST: 192.168.11.150
+      MLX_HOST: host.docker.internal
       MLX_PORT: 28080
       MLX_PROXY_PORT: 28081
       TZ: America/Toronto
+      MLX_API_KEY: your-upstream-key   # optional
     extra_hosts:
       - "host.docker.internal:host-gateway"
     mem_limit: 4g
