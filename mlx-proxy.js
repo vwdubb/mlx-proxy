@@ -42,8 +42,9 @@ const endpoints = ENDPOINTS.split(",").map(s => s.trim()).filter(Boolean).map(e 
   return { listen: Number(listen), host, port: Number(port) };
 });
 
-if (!endpoints.length) {
-  console.error('Set ENDPOINTS, e.g. ENDPOINTS="28080:localhost:8080,28001:spark:8001"');
+const invalid = ({ listen, host, port }) => !Number.isInteger(listen) || !host || !Number.isInteger(port);
+if (!endpoints.length || endpoints.some(invalid)) {
+  console.error('Set ENDPOINTS to comma-separated listen:host:port triples, e.g. ENDPOINTS="28080:localhost:8080,28001:spark:8001"');
   process.exit(1);
 }
 

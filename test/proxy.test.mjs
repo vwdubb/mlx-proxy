@@ -99,16 +99,54 @@ test("ENDPOINTS routes each listen port to its host:port and injects date", asyn
   }
 });
 
-test("exits with usage message when ENDPOINTS is unset", async () => {
+test("API_KEY overrides the Authorization header sent upstream", async () => {
+  const up = await startUpstream("k");
+  const listenPort = await freePort();
+
   const proxy = spawn("node", ["mlx-proxy.js"], {
-    env: { ...process.env, ENDPOINTS: "" },
-    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      ENDPOINTS: `${listenPort}:127.0.0.1:${up.port}`,
+      API_KEY: "secret-key",
+      TZ: "UTC",
+    },
+    stdio: "inherit",
   });
 
-  let stderr = "";
-  proxy.stderr.on("data", (c) => (stderr += c));
+  try {
+    await waitReady(listenPort);
+    up.received.length = 0; // discard waitReady's /v1/models probe
 
-  const [code] = await once(proxy, "exit");
-  assert.equal(code, 1);
-  assert.match(stderr, /Set ENDPOINTS/);
+    await fetch(`http://127.0.0.1:${listenPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer client-wrong" },
+      body: JSON.stringify(chat("hi")),
+    });
+
+    assert.equal(up.received.length, 1);
+    assert.equal(up.received[0].headers.authorization, "Bearer secret-key");
+  } finally {
+    proxy.kill();
+    await once(proxy, "exit");
+    await new Promise((r) => up.server.close(r));
+  }
 });
+
+for (const [name, value] of [
+  ["unset", ""],
+  ["missing the port", "28080:localhost"],
+]) {
+  test(`exits with usage message when ENDPOINTS is ${name}`, async () => {
+    const proxy = spawn("node", ["mlx-proxy.js"], {
+      env: { ...process.env, ENDPOINTS: value },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    let stderr = "";
+    proxy.stderr.on("data", (c) => (stderr += c));
+
+    const [code] = await once(proxy, "exit");
+    assert.equal(code, 1);
+    assert.match(stderr, /Set ENDPOINTS/);
+  });
+}
