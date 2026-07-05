@@ -1,17 +1,18 @@
 services:
-  mlx-proxy:
+  llm-proxy:
     build: .
-    image: vwdubb/mlx-proxy:latest
-    container_name: mlx-proxy
+    image: vwdubb/llm-proxy:latest
+    container_name: llm-proxy
     restart: unless-stopped
     ports:
-      - 28081:28081
+      - 28080:28080
+      - 28001:28001
+      - 28002:28002
     environment:
-      MLX_HOST: host.docker.internal
-      MLX_PORT: 28080
-      MLX_PROXY_PORT: 28081
+      # listen:host:port per endpoint. Mix hosts freely (MLX + DGX at once).
+      ENDPOINTS: "28080:host.docker.internal:8080,28001:spark:8001,28002:spark:8002"
       TZ: America/Toronto
-      MLX_API_KEY: your-upstream-key   # optional
+      API_KEY: your-upstream-key   # optional, applied to every endpoint
     extra_hosts:
       - "host.docker.internal:host-gateway"
     mem_limit: 4g

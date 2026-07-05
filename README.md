@@ -1,8 +1,9 @@
-# mlx-proxy
+# llm-proxy
 
-A tiny (~40 line, zero-dependency) HTTP reverse proxy that sits in front of an
-[MLX](https://github.com/ml-explore/mlx) / `mlx_lm.server` OpenAI-compatible
-endpoint and does two things:
+A tiny (~50 line, zero-dependency) HTTP reverse proxy that sits in front of one
+or more OpenAI-compatible LLM endpoints — such as
+[MLX](https://github.com/ml-explore/mlx) / `mlx_lm.server` on a Mac, or
+`sparkrun` on an NVIDIA DGX Spark — and does two things:
 
 1. **Injects the current date and time** into the latest user message of every
    chat request, so the model always knows "now" without you having to add it to
@@ -12,6 +13,11 @@ endpoint and does two things:
    the key into each one.
 
 Everything else is passed through untouched, including streaming responses.
+
+Each endpoint is a `listen:host:port` triple: the proxy opens one listener per
+endpoint and forwards to that host:port. Because the host is per endpoint, a
+single proxy can front several backends at once — e.g. an MLX box and a DGX
+Spark, or one port per model as `sparkrun` exposes them.
 
 ## How it works
 
@@ -24,10 +30,11 @@ For each incoming request the proxy:
 - If the body isn't JSON or has no user message, it's forwarded as-is.
 - Rewrites the `Host` header and `Content-Length` to match the upstream and the
   (possibly modified) body.
-- If `MLX_API_KEY` is set, overwrites the `Authorization` header with
-  `Bearer <MLX_API_KEY>`.
-- Forwards to `http://$MLX_HOST:$MLX_PORT<original path>` and pipes the upstream
-  response straight back to the client.
+- If `API_KEY` is set, overwrites the `Authorization` header with
+  `Bearer <API_KEY>`.
+- Forwards to the `host:port` of the endpoint whose listen port the request
+  arrived on, at the original path, and pipes the upstream response straight
+  back to the client.
 
 On upstream error it returns `502`. If the client disconnects mid-flight, the
 upstream request is destroyed.
@@ -36,25 +43,56 @@ upstream request is destroyed.
 
 All configuration is via environment variables:
 
-| Variable         | Default                  | Description                                                                 |
-| ---------------- | ------------------------ | --------------------------------------------------------------------------- |
-| `MLX_HOST`       | `host.docker.internal`   | Hostname/IP of the upstream MLX server.                                     |
-| `MLX_PORT`       | `8080`                   | Port of the upstream MLX server.                                            |
-| `MLX_PROXY_PORT` | `8081`                   | Port the proxy listens on.                                                  |
-| `MLX_API_KEY`    | _(unset)_                | If set, sent to the upstream as `Authorization: Bearer <key>`. Unset = no auth header added (passthrough). |
-| `TZ`             | `UTC`                    | Timezone used to format the injected date/time (e.g. `America/Toronto`).    |
+| Variable    | Default   | Description                                                                                                   |
+| ----------- | --------- | ------------------------------------------------------------------------------------------------------------- |
+| `ENDPOINTS` | _(unset)_ | Comma-separated `listen:host:port` triples, e.g. `28080:localhost:8080,28001:spark:8001`. Each opens a proxy listener on `listen` forwarding to `host:port`. Required — the proxy exits with a usage message if unset. |
+| `API_KEY`   | _(unset)_ | If set, sent upstream as `Authorization: Bearer <key>` on every endpoint. Unset = passthrough (incoming auth forwarded as-is). |
+| `TZ`        | `UTC`     | Timezone used to format the injected date/time (e.g. `America/Toronto`).                                       |
 
-### About `MLX_API_KEY`
+There is no shared host variable; the host is specified per endpoint in
+`ENDPOINTS`.
+
+### About `API_KEY`
 
 - When **unset**, the proxy does not add or modify the `Authorization` header —
-  whatever the client sent (if anything) is forwarded as-is. Existing setups
-  keep working unchanged.
+  whatever the client sent (if anything) is forwarded as-is.
 - When **set**, the proxy **overrides** any incoming `Authorization` header with
-  `Bearer <MLX_API_KEY>`. This means clients of the proxy don't need to know the
-  upstream key — point them at the proxy and let it authenticate on their behalf.
-- The key authenticates the proxy **to the upstream MLX server**; the proxy
-  itself does not authenticate its own clients. If you need to restrict who can
-  reach the proxy, put it on a trusted network or behind a gateway that does.
+  `Bearer <API_KEY>` on every endpoint. This means clients of the proxy don't
+  need to know the upstream key — point them at the proxy and let it
+  authenticate on their behalf.
+- The key authenticates the proxy **to the upstream server**; the proxy itself
+  does not authenticate its own clients. If you need to restrict who can reach
+  the proxy, put it on a trusted network or behind a gateway that does.
+
+## Endpoints
+
+Set `ENDPOINTS` to a comma-separated list of `listen:host:port` triples. The
+proxy opens one listener per triple and forwards to that host:port, applying
+date-injection and the optional `API_KEY` to each. Clients pick a
+model/backend by choosing the matching proxy port.
+
+Single endpoint (MLX):
+
+```sh
+ENDPOINTS="8081:127.0.0.1:8080" TZ=America/Toronto node llm-proxy.js
+```
+
+Multiple endpoints (MLX + DGX/sparkrun, one port per model):
+
+```sh
+ENDPOINTS="28080:localhost:8080,28001:spark:8001,28002:spark:8002" \
+TZ=America/Toronto \
+API_KEY=your-upstream-key \
+node llm-proxy.js
+```
+
+On startup it logs one line per endpoint:
+
+```
+:28080 → localhost:8080
+:28001 → spark:8001
+:28002 → spark:8002
+```
 
 ## Running
 
@@ -64,19 +102,19 @@ The included `docker-compose.yml` builds the image and runs the proxy:
 
 ```yaml
 services:
-  mlx-proxy:
+  llm-proxy:
     build: .
-    image: vwdubb/mlx-proxy:latest
-    container_name: mlx-proxy
+    image: vwdubb/llm-proxy:latest
+    container_name: llm-proxy
     restart: unless-stopped
     ports:
-      - 28081:28081
+      - 28080:28080
+      - 28001:28001
+      - 28002:28002
     environment:
-      MLX_HOST: host.docker.internal
-      MLX_PORT: 28080
-      MLX_PROXY_PORT: 28081
+      ENDPOINTS: "28080:host.docker.internal:8080,28001:spark:8001,28002:spark:8002"
       TZ: America/Toronto
-      MLX_API_KEY: your-upstream-key   # optional
+      API_KEY: your-upstream-key   # optional, applied to every endpoint
     extra_hosts:
       - "host.docker.internal:host-gateway"
     mem_limit: 4g
@@ -86,42 +124,39 @@ services:
 docker compose up -d --build
 ```
 
-To supply the API key without committing it, leave `MLX_API_KEY` out of the
-compose file and pass it through the environment instead:
+To supply the API key without committing it, leave `API_KEY` out of the compose
+file and pass it through the environment instead:
 
 ```sh
-MLX_API_KEY=your-upstream-key docker compose up -d --build
+API_KEY=your-upstream-key docker compose up -d --build
 ```
 
-(and reference it in compose as `MLX_API_KEY: ${MLX_API_KEY}` if you prefer it
-explicit).
+(and reference it in compose as `API_KEY: ${API_KEY}` if you prefer it explicit).
 
 ### Plain Node
 
 Requires Node 22+ (uses ES modules and modern syntax; no dependencies).
 
 ```sh
-MLX_HOST=192.168.11.150 \
-MLX_PORT=28080 \
-MLX_PROXY_PORT=28081 \
+ENDPOINTS="28080:192.168.11.150:8080" \
 TZ=America/Toronto \
-MLX_API_KEY=your-upstream-key \
-node mlx-proxy.js
+API_KEY=your-upstream-key \
+node llm-proxy.js
 ```
 
-On startup it logs the route it's proxying, e.g.:
+On startup it logs the route(s) it's proxying, e.g.:
 
 ```
-:28081 → 192.168.11.150:28080
+:28080 → 192.168.11.150:8080
 ```
 
 ## Usage
 
-Point any OpenAI-compatible client at the proxy instead of the MLX server. For
+Point any OpenAI-compatible client at the proxy instead of the backend. For
 example:
 
 ```sh
-curl http://localhost:28081/v1/chat/completions \
+curl http://localhost:28080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "your-model",
@@ -138,4 +173,6 @@ time, so it can answer accurately.
   with a `user` message — i.e. chat-completion-style requests. Other endpoints
   (e.g. `/v1/models`) and non-JSON bodies pass through unmodified.
 - The injected timestamp is always added to the **last** user message.
-- The proxy speaks plain HTTP to the upstream (`http://$MLX_HOST:$MLX_PORT`).
+- The proxy speaks plain HTTP to the upstream (`http://<host>:<port>`).
+- A single shared `API_KEY` is applied to every endpoint; per-endpoint keys are
+  not supported.
