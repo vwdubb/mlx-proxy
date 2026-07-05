@@ -1,8 +1,8 @@
 services:
-  mlx-proxy:
+  llm-proxy:
     build: .
-    image: vwdubb/mlx-proxy:latest
-    container_name: mlx-proxy
+    image: vwdubb/llm-proxy:latest
+    container_name: llm-proxy
     restart: unless-stopped
     ports:
       - 28080:28080

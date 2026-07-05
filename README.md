@@ -1,4 +1,4 @@
-# mlx-proxy
+# llm-proxy
 
 A tiny (~50 line, zero-dependency) HTTP reverse proxy that sits in front of one
 or more OpenAI-compatible LLM endpoints — such as
@@ -74,7 +74,7 @@ model/backend by choosing the matching proxy port.
 Single endpoint (MLX):
 
 ```sh
-ENDPOINTS="8081:127.0.0.1:8080" TZ=America/Toronto node mlx-proxy.js
+ENDPOINTS="8081:127.0.0.1:8080" TZ=America/Toronto node llm-proxy.js
 ```
 
 Multiple endpoints (MLX + DGX/sparkrun, one port per model):
@@ -83,7 +83,7 @@ Multiple endpoints (MLX + DGX/sparkrun, one port per model):
 ENDPOINTS="28080:localhost:8080,28001:spark:8001,28002:spark:8002" \
 TZ=America/Toronto \
 API_KEY=your-upstream-key \
-node mlx-proxy.js
+node llm-proxy.js
 ```
 
 On startup it logs one line per endpoint:
@@ -102,10 +102,10 @@ The included `docker-compose.yml` builds the image and runs the proxy:
 
 ```yaml
 services:
-  mlx-proxy:
+  llm-proxy:
     build: .
-    image: vwdubb/mlx-proxy:latest
-    container_name: mlx-proxy
+    image: vwdubb/llm-proxy:latest
+    container_name: llm-proxy
     restart: unless-stopped
     ports:
       - 28080:28080
@@ -141,7 +141,7 @@ Requires Node 22+ (uses ES modules and modern syntax; no dependencies).
 ENDPOINTS="28080:192.168.11.150:8080" \
 TZ=America/Toronto \
 API_KEY=your-upstream-key \
-node mlx-proxy.js
+node llm-proxy.js
 ```
 
 On startup it logs the route(s) it's proxying, e.g.:

@@ -61,7 +61,7 @@ test("ENDPOINTS routes each listen port to its host:port and injects date", asyn
   const listenA = await freePort();
   const listenB = await freePort();
 
-  const proxy = spawn("node", ["mlx-proxy.js"], {
+  const proxy = spawn("node", ["llm-proxy.js"], {
     env: {
       ...process.env,
       ENDPOINTS: `${listenA}:127.0.0.1:${upA.port},${listenB}:127.0.0.1:${upB.port}`,
@@ -103,7 +103,7 @@ test("API_KEY overrides the Authorization header sent upstream", async () => {
   const up = await startUpstream("k");
   const listenPort = await freePort();
 
-  const proxy = spawn("node", ["mlx-proxy.js"], {
+  const proxy = spawn("node", ["llm-proxy.js"], {
     env: {
       ...process.env,
       ENDPOINTS: `${listenPort}:127.0.0.1:${up.port}`,
@@ -137,7 +137,7 @@ for (const [name, value] of [
   ["missing the port", "28080:localhost"],
 ]) {
   test(`exits with usage message when ENDPOINTS is ${name}`, async () => {
-    const proxy = spawn("node", ["mlx-proxy.js"], {
+    const proxy = spawn("node", ["llm-proxy.js"], {
       env: { ...process.env, ENDPOINTS: value },
       stdio: ["ignore", "ignore", "pipe"],
     });
