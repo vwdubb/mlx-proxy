@@ -98,3 +98,17 @@ test("ENDPOINTS routes each listen port to its host:port and injects date", asyn
     await new Promise((r) => upB.server.close(r));
   }
 });
+
+test("exits with usage message when ENDPOINTS is unset", async () => {
+  const proxy = spawn("node", ["mlx-proxy.js"], {
+    env: { ...process.env, ENDPOINTS: "" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+
+  let stderr = "";
+  proxy.stderr.on("data", (c) => (stderr += c));
+
+  const [code] = await once(proxy, "exit");
+  assert.equal(code, 1);
+  assert.match(stderr, /Set ENDPOINTS/);
+});
