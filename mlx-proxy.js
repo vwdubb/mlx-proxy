@@ -1,5 +1,5 @@
 import { createServer, request } from "http";
-const { MLX_HOST = "host.docker.internal", MLX_PORT = 8080, MLX_PROXY_PORT = 8081, MLX_API_KEY, TZ = "UTC" } = process.env;
+const { ENDPOINTS = "", API_KEY, TZ = "UTC" } = process.env;
 
 const fmt = new Intl.DateTimeFormat("en-CA", {
   timeZone: TZ, weekday: "long", year: "numeric", month: "long",
@@ -7,7 +7,7 @@ const fmt = new Intl.DateTimeFormat("en-CA", {
   timeZoneName: "short",
 });
 
-createServer((req, res) => {
+const makeHandler = (host, port) => (req, res) => {
   const chunks = [];
   req.on("data", c => chunks.push(c));
   req.on("end", () => {
@@ -23,11 +23,11 @@ createServer((req, res) => {
       }
     } catch {}
 
-    const headers = { ...req.headers, host: `${MLX_HOST}:${MLX_PORT}`, "content-length": body.length };
+    const headers = { ...req.headers, host: `${host}:${port}`, "content-length": body.length };
     delete headers["transfer-encoding"];
-    if (MLX_API_KEY) headers["authorization"] = `Bearer ${MLX_API_KEY}`;
+    if (API_KEY) headers["authorization"] = `Bearer ${API_KEY}`;
 
-    const upstream = request(`http://${MLX_HOST}:${MLX_PORT}${req.url}`,
+    const upstream = request(`http://${host}:${port}${req.url}`,
       { method: req.method, headers, agent: false },
       r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
 
@@ -35,4 +35,17 @@ createServer((req, res) => {
     res.on("close", () => { if (!res.writableEnded) upstream.destroy(); });
     upstream.end(body);
   });
-}).listen(MLX_PROXY_PORT, () => console.log(`:${MLX_PROXY_PORT} → ${MLX_HOST}:${MLX_PORT}`));
+};
+
+const endpoints = ENDPOINTS.split(",").map(s => s.trim()).filter(Boolean).map(e => {
+  const [listen, host, port] = e.split(":").map(s => s.trim());
+  return { listen: Number(listen), host, port: Number(port) };
+});
+
+if (!endpoints.length) {
+  console.error('Set ENDPOINTS, e.g. ENDPOINTS="28080:localhost:8080,28001:spark:8001"');
+  process.exit(1);
+}
+
+for (const { listen, host, port } of endpoints)
+  createServer(makeHandler(host, port)).listen(listen, () => console.log(`:${listen} → ${host}:${port}`));
